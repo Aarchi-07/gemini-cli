@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import path from 'node:path';
 import { type FunctionCall } from '@google/genai';
 import {
   SHELL_TOOL_NAMES,
@@ -31,7 +32,15 @@ import { debugLogger } from '../utils/debugLogger.js';
 import { isRecord } from '../utils/markdownUtils.js';
 import type { CheckerRunner } from '../safety/checker-runner.js';
 import { SafetyCheckDecision } from '../safety/protocol.js';
-import { getToolAliases, AGENT_TOOL_NAME } from '../tools/tool-names.js';
+import {
+  isBuildFile,
+  extractFilePathFromArgs,
+} from '../utils/buildFileUtils.js';
+import {
+  getToolAliases,
+  AGENT_TOOL_NAME,
+  EDIT_TOOL_NAMES,
+} from '../tools/tool-names.js';
 import { PARAM_ADDITIONAL_PERMISSIONS } from '../tools/definitions/base-declarations.js';
 import {
   MCP_TOOL_PREFIX,
@@ -45,6 +54,41 @@ import {
   NoopSandboxManager,
   type SandboxPermissions,
 } from '../services/sandboxManager.js';
+
+function containsGitCommand(args: string[]): boolean {
+  if (!args || args.length === 0) return false;
+  const allowedPredecessors = new Set([
+    'sudo',
+    'env',
+    'time',
+    '&&',
+    '||',
+    ';',
+    '|',
+    '&',
+    '(',
+    '\\n',
+  ]);
+  return args.some((arg, index) => {
+    const trimmed = arg.trim();
+    if (!trimmed) return false;
+    const basename = path.basename(trimmed).toLowerCase();
+    if (basename !== 'git' && basename !== 'git.exe') {
+      return false;
+    }
+    let prevIndex = index - 1;
+    while (prevIndex >= 0 && /^[a-zA-Z_][a-zA-Z0-9_]*=/.test(args[prevIndex])) {
+      prevIndex--;
+    }
+    if (prevIndex >= 0) {
+      const prev = args[prevIndex].toLowerCase();
+      if (!allowedPredecessors.has(prev)) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
 
 function isWildcardPattern(name: string): boolean {
   return name === '*' || name.includes('*');
@@ -205,6 +249,7 @@ export class PolicyEngine {
   private readonly checkerRunner?: CheckerRunner;
   private approvalMode: ApprovalMode;
   private readonly sandboxManager: SandboxManager;
+  private readonly isTrustedFolderFn?: () => boolean;
 
   constructor(config: PolicyEngineConfig = {}, checkerRunner?: CheckerRunner) {
     this.rules = (config.rules ?? []).sort(
@@ -258,6 +303,14 @@ export class PolicyEngine {
     this.checkerRunner = checkerRunner;
     this.approvalMode = config.approvalMode ?? ApprovalMode.DEFAULT;
     this.sandboxManager = config.sandboxManager ?? new NoopSandboxManager();
+    this.isTrustedFolderFn = config.isTrustedFolder;
+  }
+
+  isTrustedFolder(): boolean {
+    if (this.isTrustedFolderFn) {
+      return this.isTrustedFolderFn();
+    }
+    return true;
   }
 
   /**
@@ -284,9 +337,15 @@ export class PolicyEngine {
   private shouldDowngradeForRedirection(
     command: string,
     allowRedirection?: boolean,
+    rule?: PolicyRule,
   ): boolean {
     if (allowRedirection) return false;
     if (!hasRedirection(command)) return false;
+
+    // Require explicit allowRedirection when matching a command-prefix rule.
+    if (rule?.argsPattern && !allowRedirection) {
+      return true;
+    }
 
     // Do not downgrade (do not ask user) if in AUTO_EDIT or YOLO mode.
     // These modes trust the agent's actions (YOLO) or specific task (AUTO_EDIT).
@@ -306,13 +365,43 @@ export class PolicyEngine {
   private async applyShellHeuristics(
     command: string,
     decision: PolicyDecision,
+    dir_path?: string,
   ): Promise<PolicyDecision> {
+    if (decision === PolicyDecision.DENY) {
+      return PolicyDecision.DENY;
+    }
     await initializeShellParsers();
     try {
       const parsedObjArgs = shellParse(command);
       const parsedArgs = parsedObjArgs.map(extractStringFromParseEntry);
 
-      if (this.sandboxManager.isDangerousCommand(parsedArgs)) {
+      const workspace =
+        typeof this.sandboxManager.getWorkspace === 'function'
+          ? this.sandboxManager.getWorkspace()
+          : process.cwd();
+      const effectiveCwd = dir_path
+        ? path.resolve(workspace, dir_path)
+        : workspace;
+
+      if (
+        effectiveCwd !== workspace &&
+        !isSubpath(workspace, effectiveCwd) &&
+        this.approvalMode !== ApprovalMode.YOLO
+      ) {
+        debugLogger.debug(
+          `[PolicyEngine.check] Command working directory is outside workspace, forcing ASK_USER: ${command}`,
+        );
+        return PolicyDecision.ASK_USER;
+      }
+
+      if (containsGitCommand(parsedArgs) && !this.isTrustedFolder()) {
+        debugLogger.debug(
+          `[PolicyEngine.check] Git command evaluated in untrusted workspace. Forcing ASK_USER: ${command}`,
+        );
+        return PolicyDecision.ASK_USER;
+      }
+
+      if (this.sandboxManager.isDangerousCommand(parsedArgs, effectiveCwd)) {
         if (this.approvalMode === ApprovalMode.YOLO) {
           debugLogger.debug(
             `[PolicyEngine.check] Command evaluated as dangerous, but YOLO mode is active. Preserving decision: ${command}`,
@@ -327,9 +416,23 @@ export class PolicyEngine {
       }
 
       if (
-        this.sandboxManager.isKnownSafeCommand(parsedArgs) &&
+        this.sandboxManager.isKnownSafeCommand(parsedArgs, effectiveCwd) &&
         decision === PolicyDecision.ASK_USER
       ) {
+        if (effectiveCwd !== workspace && !isSubpath(workspace, effectiveCwd)) {
+          debugLogger.debug(
+            `[PolicyEngine.check] dir_path evaluated outside workspace. Preserving ASK_USER: ${command}`,
+          );
+          return PolicyDecision.ASK_USER;
+        }
+
+        if (containsGitCommand(parsedArgs) && !this.isTrustedFolder()) {
+          debugLogger.debug(
+            `[PolicyEngine.check] Known safe Git command evaluated in untrusted workspace. Preserving ASK_USER: ${command}`,
+          );
+          return PolicyDecision.ASK_USER;
+        }
+
         debugLogger.debug(
           `[PolicyEngine.check] Command evaluated as known safe, overriding ASK_USER to ALLOW: ${command}`,
         );
@@ -414,7 +517,7 @@ export class PolicyEngine {
 
     // Check for redirection on the full command string.
     // Redirection always downgrades ALLOW to ASK_USER (it never upgrades).
-    if (this.shouldDowngradeForRedirection(command, allowRedirection)) {
+    if (this.shouldDowngradeForRedirection(command, allowRedirection, rule)) {
       if (aggregateDecision === PolicyDecision.ALLOW) {
         debugLogger.debug(
           `[PolicyEngine.check] Downgrading ALLOW to ASK_USER for redirected command: ${command}`,
@@ -480,7 +583,11 @@ export class PolicyEngine {
         // Downgrade if sub-command has redirection
         if (
           subResult.decision === PolicyDecision.ALLOW &&
-          this.shouldDowngradeForRedirection(subCmd, allowRedirection)
+          this.shouldDowngradeForRedirection(
+            subCmd,
+            subResult.rule?.allowRedirection ?? allowRedirection,
+            subResult.rule,
+          )
         ) {
           if (aggregateDecision === PolicyDecision.ALLOW) {
             aggregateDecision = PolicyDecision.ASK_USER;
@@ -605,7 +712,11 @@ export class PolicyEngine {
           !('commandPrefix' in rule) &&
           !rule.argsPattern
         ) {
-          ruleDecision = await this.applyShellHeuristics(command, ruleDecision);
+          ruleDecision = await this.applyShellHeuristics(
+            command,
+            ruleDecision,
+            shellDirPath,
+          );
         }
 
         if (isShellCommand && toolName) {
@@ -637,38 +748,37 @@ export class PolicyEngine {
         debugLogger.debug(
           `[PolicyEngine.check] NO MATCH in YOLO mode - using ALLOW`,
         );
-        return {
-          decision: PolicyDecision.ALLOW,
-        };
-      }
+        decision = PolicyDecision.ALLOW;
+      } else {
+        debugLogger.debug(
+          `[PolicyEngine.check] NO MATCH - using default decision: ${this.defaultDecision}`,
+        );
+        if (toolName && SHELL_TOOL_NAMES.includes(toolName)) {
+          let heuristicDecision = this.defaultDecision;
+          if (!skipHeuristics && command) {
+            heuristicDecision = await this.applyShellHeuristics(
+              command,
+              heuristicDecision,
+              shellDirPath,
+            );
+          }
 
-      debugLogger.debug(
-        `[PolicyEngine.check] NO MATCH - using default decision: ${this.defaultDecision}`,
-      );
-      if (toolName && SHELL_TOOL_NAMES.includes(toolName)) {
-        let heuristicDecision = this.defaultDecision;
-        if (!skipHeuristics && command) {
-          heuristicDecision = await this.applyShellHeuristics(
+          const shellResult = await this.checkShellCommand(
+            toolName,
             command,
             heuristicDecision,
+            serverName,
+            shellDirPath,
+            false,
+            undefined,
+            toolAnnotations,
+            subagent,
           );
+          decision = shellResult.decision;
+          matchedRule = shellResult.rule;
+        } else {
+          decision = this.defaultDecision;
         }
-
-        const shellResult = await this.checkShellCommand(
-          toolName,
-          command,
-          heuristicDecision,
-          serverName,
-          shellDirPath,
-          false,
-          undefined,
-          toolAnnotations,
-          subagent,
-        );
-        decision = shellResult.decision;
-        matchedRule = shellResult.rule;
-      } else {
-        decision = this.defaultDecision;
       }
     }
 
@@ -698,6 +808,61 @@ export class PolicyEngine {
             decision = PolicyDecision.ASK_USER;
             break;
           }
+        }
+      }
+
+      // Build File Protection: Always require user confirmation when modifying build configuration files
+      const isFileEditTool = toolNamesToTry.some((name) => {
+        if (
+          EDIT_TOOL_NAMES.has(name) ||
+          name === 'replace' ||
+          name === 'write_file'
+        ) {
+          return true;
+        }
+        const editKeywords = new Set([
+          'write',
+          'edit',
+          'replace',
+          'patch',
+          'update',
+          'create',
+          'append',
+          'save',
+        ]);
+        const tokens = name.toLowerCase().split(/[^a-z0-9]+/);
+        return tokens.some((token) => editKeywords.has(token));
+      });
+      if (isFileEditTool) {
+        let targetPath = extractFilePathFromArgs(toolCall.args);
+        if (targetPath) {
+          targetPath = targetPath.trim();
+          if (process.platform === 'win32') {
+            let end = targetPath.length;
+            while (
+              end > 0 &&
+              (targetPath[end - 1] === '.' || targetPath[end - 1] === ' ')
+            ) {
+              end--;
+            }
+            targetPath = targetPath.slice(0, end);
+          }
+        }
+        if (targetPath && isBuildFile(targetPath)) {
+          debugLogger.debug(
+            `[PolicyEngine.check] Target path '${targetPath}' is a build file. Downgrading to ASK_USER.`,
+          );
+          decision = this.nonInteractive
+            ? PolicyDecision.DENY
+            : PolicyDecision.ASK_USER;
+          matchedRule = {
+            toolName: toolCall.name ?? 'replace',
+            decision,
+            priority: Number.MAX_SAFE_INTEGER,
+            source: 'Build File Protection',
+            denyMessage:
+              'Modifying build configuration files requires explicit user confirmation',
+          };
         }
       }
     }
@@ -751,6 +916,10 @@ export class PolicyEngine {
           }
         }
       }
+    }
+
+    if (this.nonInteractive && decision === PolicyDecision.ASK_USER) {
+      decision = PolicyDecision.DENY;
     }
 
     return {

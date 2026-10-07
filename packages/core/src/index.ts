@@ -36,6 +36,7 @@ export * from './commands/types.js';
 export * from './core/baseLlmClient.js';
 export * from './core/client.js';
 export * from './core/contentGenerator.js';
+export * from './core/fakeContentGenerator.js';
 export * from './core/loggingContentGenerator.js';
 export * from './core/geminiChat.js';
 export * from './core/logger.js';
@@ -92,8 +93,11 @@ export * from './utils/sessionOperations.js';
 export * from './utils/planUtils.js';
 export * from './utils/approvalModeUtils.js';
 export * from './utils/fileDiffUtils.js';
+export * from './utils/path-validator.js';
+export * from './utils/atCommandUtils.js';
 export * from './utils/retry.js';
 export * from './utils/shell-utils.js';
+export * from './utils/security.js';
 export {
   PolicyDecision,
   ApprovalMode,
@@ -102,7 +106,6 @@ export {
 export * from './utils/tool-utils.js';
 export * from './utils/tool-visibility.js';
 export * from './utils/terminalSerializer.js';
-export * from './utils/systemEncoding.js';
 export * from './utils/textUtils.js';
 export * from './utils/formatters.js';
 export * from './utils/generateContentResponseUtilities.js';
@@ -258,8 +261,14 @@ export type { MCPOAuthConfig } from './mcp/oauth-provider.js';
 export type {
   OAuthAuthorizationServerMetadata,
   OAuthProtectedResourceMetadata,
+  OAuthUrlValidationOptions,
 } from './mcp/oauth-utils.js';
-export { OAuthUtils } from './mcp/oauth-utils.js';
+export {
+  OAuthUtils,
+  OAuthSecurityError,
+  isLoopbackUrl,
+  validateOAuthEndpointUrl,
+} from './mcp/oauth-utils.js';
 
 // Export telemetry functions
 export * from './telemetry/index.js';

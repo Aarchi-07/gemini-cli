@@ -46,9 +46,10 @@ const mockIdeClient = vi.hoisted(() => ({
   getInstance: vi.fn().mockReturnValue(new Promise(() => {})),
 }));
 
-// Mock stdout
+// Mock stdout and ink app
 const mocks = vi.hoisted(() => ({
   mockStdout: { write: vi.fn() },
+  mockRerender: vi.fn(),
 }));
 const terminalNotificationsMocks = vi.hoisted(() => ({
   notifyViaTerminal: vi.fn().mockResolvedValue(true),
@@ -113,12 +114,15 @@ import {
   type OverflowActions,
 } from './contexts/OverflowContext.js';
 
-// Mock useStdout to capture terminal title writes
+// Mock useStdout and useApp to capture terminal title writes and spy on re-renders
 vi.mock('ink', async (importOriginal) => {
   const actual = await importOriginal<typeof import('ink')>();
   return {
     ...actual,
     useStdout: () => ({ stdout: mocks.mockStdout }),
+    useApp: () => ({
+      rerender: mocks.mockRerender,
+    }),
     measureElement: vi.fn(),
   };
 });
@@ -150,6 +154,9 @@ vi.mock('./hooks/useQuotaAndFallback.js');
 vi.mock('./hooks/useHistoryManager.js');
 vi.mock('./hooks/useThemeCommand.js');
 vi.mock('./auth/useAuth.js');
+vi.mock('../config/auth.js', () => ({
+  validateAuthMethod: vi.fn().mockResolvedValue(null),
+}));
 vi.mock('./hooks/useEditorSettings.js');
 vi.mock('./hooks/useSettingsCommand.js');
 vi.mock('./hooks/useModelCommand.js');
@@ -217,6 +224,7 @@ vi.mock('../utils/cleanup.js');
 import { useHistory } from './hooks/useHistoryManager.js';
 import { useThemeCommand } from './hooks/useThemeCommand.js';
 import { useAuthCommand } from './auth/useAuth.js';
+import { validateAuthMethod } from '../config/auth.js';
 import { useEditorSettings } from './hooks/useEditorSettings.js';
 import { useSettingsCommand } from './hooks/useSettingsCommand.js';
 import { useModelCommand } from './hooks/useModelCommand.js';
@@ -487,12 +495,12 @@ describe('AppContainer State Management', () => {
     vi.spyOn(mockConfig, 'initialize').mockResolvedValue(undefined);
     vi.spyOn(mockConfig, 'getDebugMode').mockReturnValue(false);
 
-    mockExtensionManager = vi.mockObject({
+    mockExtensionManager = {
       getExtensions: vi.fn().mockReturnValue([]),
       setRequestConsent: vi.fn(),
       setRequestSetting: vi.fn(),
       start: vi.fn(),
-    } as unknown as ExtensionManager);
+    } as unknown as MockedObject<ExtensionManager>;
     vi.spyOn(mockConfig, 'getExtensionLoader').mockReturnValue(
       mockExtensionManager,
     );
@@ -576,6 +584,36 @@ describe('AppContainer State Management', () => {
   });
 
   describe('State Initialization', () => {
+    it('calls validateAuthMethod and onAuthError if validation fails', async () => {
+      const mockOnAuthError = vi.fn();
+      mockedUseAuthCommand.mockReturnValue({
+        authState: 'authenticated',
+        setAuthState: vi.fn(),
+        authError: null,
+        onAuthError: mockOnAuthError,
+      });
+      vi.mocked(validateAuthMethod).mockResolvedValueOnce('Validation Failed');
+
+      const { unmount } = await act(async () =>
+        renderAppContainer({
+          settings: createMockSettings({
+            merged: {
+              security: {
+                auth: { selectedType: 'oauth-personal', useExternal: false },
+              },
+            },
+          }),
+        }),
+      );
+
+      await waitFor(() => {
+        expect(validateAuthMethod).toHaveBeenCalledWith('oauth-personal');
+        expect(mockOnAuthError).toHaveBeenCalledWith('Validation Failed');
+      });
+
+      unmount();
+    });
+
     it('sends a macOS notification when confirmation is pending and terminal is unfocused', async () => {
       mockedUseFocusState.mockReturnValue({
         isFocused: false,
@@ -1263,6 +1301,42 @@ describe('AppContainer State Management', () => {
 
       // Should not call resumeChat when client is not initialized
       expect(mockResumeChat).not.toHaveBeenCalled();
+      unmount();
+    });
+  });
+
+  describe('SessionStart Hook Rendering', () => {
+    it('does not render systemMessage directly (avoids duplicate with HookSystemMessage event)', async () => {
+      const mockAddItem = vi.fn();
+      mockedUseHistory.mockReturnValue({
+        history: [],
+        addItem: mockAddItem,
+        updateItem: vi.fn(),
+        clearItems: vi.fn(),
+        loadHistory: vi.fn(),
+      });
+
+      const fireSessionStartEvent = vi.fn().mockResolvedValue({
+        systemMessage: 'Hello from SessionStart hook',
+        getAdditionalContext: vi.fn(() => undefined),
+      });
+      vi.spyOn(mockConfig, 'getHookSystem').mockReturnValue({
+        fireSessionEndEvent: vi.fn().mockResolvedValue(undefined),
+        fireSessionStartEvent,
+      } as unknown as ReturnType<Config['getHookSystem']>);
+
+      const { unmount } = await act(async () => renderAppContainer());
+      await waitFor(() => expect(fireSessionStartEvent).toHaveBeenCalled());
+
+      // The direct-render path (the bug) would call addItem with the
+      // systemMessage text and no `source` field. The HookSystemMessage
+      // event-listener path (the correct one) always sets `source`.
+      const directRenderCall = mockAddItem.mock.calls.find(
+        ([item]) =>
+          item?.text === 'Hello from SessionStart hook' && !item?.source,
+      );
+      expect(directRenderCall).toBeUndefined();
+
       unmount();
     });
   });
@@ -2849,6 +2923,33 @@ describe('AppContainer State Management', () => {
       unmount!();
     });
 
+    it('calls app.rerender() when ExternalEditorClosed event is received in terminalBuffer mode', async () => {
+      vi.spyOn(mockConfig, 'getUseTerminalBuffer').mockReturnValue(true);
+      vi.spyOn(mockConfig, 'getUseAlternateBuffer').mockReturnValue(false);
+      vi.spyOn(mockConfig, 'getScreenReader').mockReturnValue(false);
+
+      mocks.mockRerender.mockClear();
+
+      let unmount: () => void;
+      await act(async () => {
+        const result = await renderAppContainer();
+        unmount = result.unmount;
+      });
+      await waitFor(() => expect(capturedUIState).toBeTruthy());
+
+      const handler = mockCoreEvents.on.mock.calls.find(
+        (call: unknown[]) => call[0] === CoreEvent.ExternalEditorClosed,
+      )?.[1];
+      expect(handler).toBeDefined();
+
+      act(() => {
+        handler();
+      });
+
+      expect(mocks.mockRerender).toHaveBeenCalledTimes(1);
+      unmount!();
+    });
+
     it('updates currentModel when ModelChanged event is received', async () => {
       // Arrange: Mock initial model
       vi.spyOn(mockConfig, 'getModel').mockReturnValue('initial-model');
@@ -3441,6 +3542,182 @@ describe('AppContainer State Management', () => {
       await waitFor(() => {
         expect(capturedUIState.showIsExpandableHint).toBe(true);
       });
+
+      unmount();
+    });
+
+    it('does not collapse unconstrained height on navigation keys, but collapses on Escape', async () => {
+      const { stdin, unmount } = await act(async () => renderAppContainer());
+      await waitFor(() => expect(capturedOverflowActions).toBeTruthy());
+
+      expect(capturedUIState.constrainHeight).toBe(true);
+
+      // Expand via Ctrl+O
+      act(() => {
+        stdin.write('\x0f');
+      });
+      expect(capturedUIState.constrainHeight).toBe(false);
+
+      mocks.mockStdout.write.mockClear();
+
+      // Simulate PageUp and Up Arrow navigation keys
+      act(() => {
+        stdin.write('\x1b[5~');
+        stdin.write('\x1b[A');
+      });
+
+      // Should remain expanded and not clear terminal
+      expect(capturedUIState.constrainHeight).toBe(false);
+      expect(mocks.mockStdout.write).not.toHaveBeenCalledWith(
+        ansiEscapes.clearTerminal,
+      );
+
+      // Simulate Escape key to exit expanded view
+      act(() => {
+        stdin.write('\x1b');
+      });
+      act(() => {
+        vi.advanceTimersByTime(100);
+      });
+
+      await waitFor(() => {
+        expect(capturedUIState.constrainHeight).toBe(true);
+      });
+
+      unmount();
+    });
+
+    it('does not reset the hint timer when an overflowing ID is removed while others remain', async () => {
+      const { unmount } = await act(async () => renderAppContainer());
+      await waitFor(() => expect(capturedOverflowActions).toBeTruthy());
+
+      act(() => {
+        capturedOverflowActions.addOverflowingId('test-id-1');
+        capturedOverflowActions.addOverflowingId('test-id-2');
+      });
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+
+      await waitFor(() => {
+        expect(capturedUIState.showIsExpandableHint).toBe(true);
+      });
+
+      // Advance half the duration
+      act(() => {
+        vi.advanceTimersByTime(EXPAND_HINT_DURATION_MS / 2);
+      });
+      expect(capturedUIState.showIsExpandableHint).toBe(true);
+
+      // Removing one overflowing ID should NOT reset the hint timer
+      act(() => {
+        capturedOverflowActions.removeOverflowingId('test-id-2');
+      });
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+
+      // Advance the remaining half of the original timer
+      act(() => {
+        vi.advanceTimersByTime(EXPAND_HINT_DURATION_MS / 2 - 1);
+      });
+
+      await waitFor(() => {
+        expect(capturedUIState.showIsExpandableHint).toBe(false);
+      });
+
+      unmount();
+    });
+
+    it('does not clear terminal when expanding with Ctrl+O if there are no last-turn tool calls in history', async () => {
+      const { stdin, unmount } = await act(async () => renderAppContainer());
+
+      mocks.mockStdout.write.mockClear();
+
+      // Expand with Ctrl+O when history has no last-turn tool calls
+      act(() => {
+        stdin.write('\x0f');
+      });
+
+      expect(capturedUIState.constrainHeight).toBe(false);
+      expect(mocks.mockStdout.write).not.toHaveBeenCalledWith(
+        ansiEscapes.clearTerminal,
+      );
+
+      // Collapse with Ctrl+O should still refresh static and clear terminal
+      act(() => {
+        stdin.write('\x0f');
+      });
+
+      expect(capturedUIState.constrainHeight).toBe(true);
+      expect(mocks.mockStdout.write).toHaveBeenCalledWith(
+        ansiEscapes.clearTerminal,
+      );
+
+      unmount();
+    });
+
+    it('clears terminal when expanding with Ctrl+O if there are last-turn tool calls in history', async () => {
+      (useHistory as Mock).mockReturnValue({
+        history: [
+          { id: 1, type: 'user', text: 'run something' },
+          {
+            id: 2,
+            type: 'tool_group',
+            tools: [
+              {
+                callId: 'call-1',
+                name: 'test_tool',
+                description: 'desc',
+                status: CoreToolCallStatus.Success,
+                resultDisplay: 'result',
+                confirmationDetails: undefined,
+              },
+            ],
+          },
+        ],
+        addItem: vi.fn(),
+        updateItem: vi.fn(),
+        clearItems: vi.fn(),
+        loadHistory: vi.fn(),
+      });
+
+      const { stdin, unmount } = await act(async () => renderAppContainer());
+
+      mocks.mockStdout.write.mockClear();
+
+      act(() => {
+        stdin.write('\x0f');
+      });
+
+      expect(capturedUIState.constrainHeight).toBe(false);
+      expect(mocks.mockStdout.write).toHaveBeenCalledWith(
+        ansiEscapes.clearTerminal,
+      );
+
+      unmount();
+    });
+
+    it('passes pauseUpdates=true to useLoadingIndicator when expanded in standard mode', async () => {
+      const { stdin, unmount } = await act(async () => renderAppContainer());
+
+      expect(useLoadingIndicator).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          pauseUpdates: false,
+        }),
+      );
+
+      act(() => {
+        stdin.write('\x0f');
+      });
+
+      expect(capturedUIState.constrainHeight).toBe(false);
+      expect(useLoadingIndicator).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          pauseUpdates: true,
+        }),
+      );
 
       unmount();
     });

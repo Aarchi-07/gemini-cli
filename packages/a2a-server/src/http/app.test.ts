@@ -131,6 +131,7 @@ describe('E2E Tests', () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('should create a new task and stream status updates (text-content) via POST /', async () => {
@@ -1059,7 +1060,7 @@ describe('E2E Tests', () => {
       };
       vi.spyOn(commandRegistry, 'get').mockReturnValue(mockCommand);
 
-      delete process.env['CODER_AGENT_WORKSPACE_PATH'];
+      vi.stubEnv('CODER_AGENT_WORKSPACE_PATH', '');
       const response = await request(app)
         .post('/executeCommand')
         .send({ command: 'test-command', args: [] });
@@ -1079,7 +1080,7 @@ describe('E2E Tests', () => {
       };
       vi.spyOn(commandRegistry, 'get').mockReturnValue(mockWorkspaceCommand);
 
-      delete process.env['CODER_AGENT_WORKSPACE_PATH'];
+      vi.stubEnv('CODER_AGENT_WORKSPACE_PATH', '');
       const response = await request(app)
         .post('/executeCommand')
         .send({ command: 'workspace-command', args: [] });
@@ -1101,7 +1102,7 @@ describe('E2E Tests', () => {
       };
       vi.spyOn(commandRegistry, 'get').mockReturnValue(mockWorkspaceCommand);
 
-      process.env['CODER_AGENT_WORKSPACE_PATH'] = '/tmp/test-workspace';
+      vi.stubEnv('CODER_AGENT_WORKSPACE_PATH', '/tmp/test-workspace');
       const response = await request(app)
         .post('/executeCommand')
         .send({ command: 'workspace-command', args: [] });
@@ -1260,6 +1261,55 @@ describe('E2E Tests', () => {
 
       listenSpy.mockRestore();
       exitSpy.mockRestore();
+    });
+  });
+
+  describe('createApp V2 settings compatibility', () => {
+    it('should read V2 security.folderTrust.enabled from loadSettings during app initialization', async () => {
+      const settingsMod = await import('../config/settings.js');
+      const coreMod = await import('@google/gemini-cli-core');
+      const configMod = await import('../config/config.js');
+
+      const loadSettingsSpy = vi
+        .spyOn(settingsMod, 'loadSettings')
+        .mockReturnValue({
+          security: {
+            folderTrust: {
+              enabled: false,
+            },
+          },
+          logging: {
+            level: 'debug',
+          },
+        });
+      const checkPathTrustSpy = vi
+        .spyOn(coreMod, 'checkPathTrust')
+        .mockReturnValue({ isTrusted: true, source: 'file' });
+
+      await createApp();
+
+      expect(loadSettingsSpy).toHaveBeenCalled();
+      expect(checkPathTrustSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          isFolderTrustEnabled: false,
+        }),
+      );
+      expect(configMod.loadConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          security: {
+            folderTrust: {
+              enabled: false,
+            },
+          },
+        }),
+        expect.anything(),
+        'a2a-server',
+        true,
+        expect.any(String),
+      );
+
+      loadSettingsSpy.mockRestore();
+      checkPathTrustSpy.mockRestore();
     });
   });
 });

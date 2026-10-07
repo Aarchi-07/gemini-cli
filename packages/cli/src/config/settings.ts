@@ -21,6 +21,8 @@ import {
   AuthType,
   type AdminControlsSettings,
   createCache,
+  isFileAndDirectorySecureSync,
+  createPathSecurityCache,
 } from '@google/gemini-cli-core';
 import stripJsonComments from 'strip-json-comments';
 import { DefaultLight } from '../ui/themes/builtin/light/default-light.js';
@@ -310,6 +312,9 @@ export interface LoadedSettingsSnapshot {
   merged: MergedSettings;
 }
 
+export const UNTRUSTED_WORKSPACE_SETTINGS_ERROR =
+  'Cannot modify settings in an untrusted workspace. To enable this, verify the source of the repository and set GEMINI_CLI_TRUST_WORKSPACE=true or move your configuration to the global settings file.';
+
 export class LoadedSettings {
   constructor(
     system: SettingsFile,
@@ -374,6 +379,7 @@ export class LoadedSettings {
       ...workspace,
       settings: {},
       originalSettings: {},
+      readOnly: true,
     };
   }
 
@@ -459,6 +465,15 @@ export class LoadedSettings {
   setValue(scope: LoadableSettingScope, key: string, value: unknown): void {
     const settingsFile = this.forScope(scope);
 
+    if (scope === SettingScope.Workspace && !this.isPersistable(settingsFile)) {
+      if (settingsFile.path === '' || settingsFile.path === this.user.path) {
+        throw new Error(
+          'Cannot modify workspace settings in the home directory. Please use user scope instead.',
+        );
+      }
+      throw new Error(UNTRUSTED_WORKSPACE_SETTINGS_ERROR);
+    }
+
     // Clone value to prevent reference sharing
     const valueToSet =
       typeof value === 'object' && value !== null
@@ -508,6 +523,51 @@ export class LoadedSettings {
 
     this._remoteAdminSettings = { admin };
     this._merged = this.computeMergedSettings();
+  }
+
+  /**
+   * Returns a consolidated list of excluded MCP servers across all settings files.
+   */
+  getConsolidatedExcludedMcpServers(): string[] {
+    const scopes = [
+      this.system,
+      this.systemDefaults,
+      this.user,
+      this.workspace,
+    ];
+    return scopes.flatMap((scope) => {
+      const excluded = scope?.settings?.mcp?.excluded;
+      return Array.isArray(excluded) ? excluded : [];
+    });
+  }
+
+  /**
+   * Returns a consolidated list of allowed MCP servers (via intersection of all defined lists).
+   */
+  getConsolidatedAllowedMcpServers(): string[] | undefined {
+    const scopes = [
+      this.system,
+      this.systemDefaults,
+      this.user,
+      this.workspace,
+    ];
+    const definedAllowlists = scopes.flatMap((scope) => {
+      const allowed = scope?.settings?.mcp?.allowed;
+      return Array.isArray(allowed) ? [allowed] : [];
+    });
+
+    if (definedAllowlists.length === 0) {
+      return undefined;
+    }
+
+    return definedAllowlists.reduce((acc, current) => {
+      const normalizedCurrent = new Set(
+        current.map((item) => item.toLowerCase().trim()),
+      );
+      return acc.filter((item) =>
+        normalizedCurrent.has(item.toLowerCase().trim()),
+      );
+    });
   }
 }
 
@@ -799,8 +859,34 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
     return { settings: {}, rawSettings: {} };
   };
 
-  const systemResult = load(systemSettingsPath);
-  const systemDefaultsResult = load(systemDefaultsPath);
+  const securityCache = createPathSecurityCache();
+
+  const loadSystemFile = (
+    filePath: string,
+    fileLabel: string,
+  ): { settings: Settings; rawSettings: Settings; rawJson?: string } => {
+    if (!fs.existsSync(filePath)) {
+      return { settings: {}, rawSettings: {} };
+    }
+
+    const check = isFileAndDirectorySecureSync(filePath, securityCache);
+    if (!check.secure) {
+      settingsErrors.push({
+        message: `Security Warning: Skipping ${fileLabel} file '${filePath}': ${check.reason}`,
+        path: filePath,
+        severity: 'warning',
+      });
+      return { settings: {}, rawSettings: {} };
+    }
+
+    return load(filePath);
+  };
+
+  const systemResult = loadSystemFile(systemSettingsPath, 'system settings');
+  const systemDefaultsResult = loadSystemFile(
+    systemDefaultsPath,
+    'system defaults',
+  );
   const userResult = load(USER_SETTINGS_PATH);
 
   let workspaceResult: {
@@ -831,6 +917,35 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
   userSettings = userResult.settings;
   workspaceSettings = workspaceResult.settings;
 
+  // Support environment variable override from relaunch supervisor across exit code 199
+  const envAuthOverride = process.env['GEMINI_CLI_AUTH_OVERRIDE'];
+  if (envAuthOverride) {
+    delete process.env['GEMINI_CLI_AUTH_OVERRIDE'];
+  }
+  const authOverride =
+    envAuthOverride &&
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+    Object.values(AuthType).includes(envAuthOverride as AuthType)
+      ? // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        (envAuthOverride as AuthType)
+      : undefined;
+  if (authOverride) {
+    if (!userSettings.security) {
+      userSettings.security = {};
+    }
+    if (!userSettings.security.auth) {
+      userSettings.security.auth = {};
+    }
+    userSettings.security.auth.selectedType = authOverride;
+    if (!userOriginalSettings.security) {
+      userOriginalSettings.security = {};
+    }
+    if (!userOriginalSettings.security.auth) {
+      userOriginalSettings.security.auth = {};
+    }
+    userOriginalSettings.security.auth.selectedType = authOverride;
+  }
+
   // Support legacy theme names
   if (userSettings.ui?.theme === 'VS') {
     userSettings.ui.theme = DefaultLight.name;
@@ -853,7 +968,7 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
   );
   const isTrusted =
     isWorkspaceTrusted(initialTrustCheckSettings as Settings, workspaceDir)
-      .isTrusted ?? false;
+      ?.isTrusted ?? false;
 
   // Create a temporary merged settings object to pass to loadEnvironment.
   const tempMergedSettings = mergeSettings(

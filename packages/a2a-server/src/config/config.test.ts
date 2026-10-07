@@ -10,7 +10,6 @@ import { loadConfig } from './config.js';
 import type { Settings } from './settings.js';
 import {
   type ExtensionLoader,
-  FileDiscoveryService,
   getCodeAssistServer,
   Config,
   ExperimentFlags,
@@ -20,8 +19,11 @@ import {
   isHeadlessMode,
   FatalAuthenticationError,
   PolicyDecision,
+  ApprovalMode,
   PRIORITY_YOLO_ALLOW_ALL,
+  createPolicyEngineConfig,
 } from '@google/gemini-cli-core';
+import type { AgentSettings } from '../types.js';
 
 // Mock dependencies
 vi.mock('@google/gemini-cli-core', async (importOriginal) => {
@@ -48,21 +50,42 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
       };
       return mockConfig;
     }),
-    loadServerHierarchicalMemory: vi.fn().mockResolvedValue({
-      memoryContent: { global: '', extension: '', project: '' },
-      fileCount: 0,
-      filePaths: [],
-    }),
     startupProfiler: {
       flush: vi.fn(),
     },
     isHeadlessMode: vi.fn().mockReturnValue(false),
-    FileDiscoveryService: vi.fn(),
     getCodeAssistServer: vi.fn(),
     fetchAdminControlsOnce: vi.fn(),
+    createPolicyEngineConfig: vi
+      .fn()
+      .mockImplementation(
+        (_settings, mode, _defaultPoliciesDir, _interactive) => ({
+          rules:
+            mode === actual.ApprovalMode.YOLO
+              ? [
+                  {
+                    toolName: '*',
+                    decision: actual.PolicyDecision.ALLOW,
+                    priority: actual.PRIORITY_YOLO_ALLOW_ALL,
+                    modes: [actual.ApprovalMode.YOLO],
+                    allowRedirection: true,
+                  },
+                ]
+              : [
+                  {
+                    toolName: 'read_file',
+                    decision: actual.PolicyDecision.ALLOW,
+                    priority: 1.05,
+                    source: 'Default: read-only.toml',
+                  },
+                ],
+          checkers: [],
+        }),
+      ),
     coreEvents: {
       emitAdminSettingsChanged: vi.fn(),
     },
+    checkPathTrust: vi.fn(() => ({ isTrusted: false })),
   };
 });
 
@@ -223,11 +246,13 @@ describe('loadConfig', () => {
     ]);
   });
 
-  it('should set customIgnoreFilePaths when settings.fileFiltering.customIgnoreFilePaths is present', async () => {
+  it('should set customIgnoreFilePaths when settings.context.fileFiltering.customIgnoreFilePaths is present', async () => {
     const testPath = '/settings/ignore';
     const settings: Settings = {
-      fileFiltering: {
-        customIgnoreFilePaths: [testPath],
+      context: {
+        fileFiltering: {
+          customIgnoreFilePaths: [testPath],
+        },
       },
     };
     const config = await loadConfig(settings, mockExtensionLoader, taskId);
@@ -242,8 +267,10 @@ describe('loadConfig', () => {
     const settingsPath = '/settings/ignore';
     vi.stubEnv('CUSTOM_IGNORE_FILE_PATHS', envPath);
     const settings: Settings = {
-      fileFiltering: {
-        customIgnoreFilePaths: [settingsPath],
+      context: {
+        fileFiltering: {
+          customIgnoreFilePaths: [settingsPath],
+        },
       },
     };
     const config = await loadConfig(settings, mockExtensionLoader, taskId);
@@ -268,62 +295,52 @@ describe('loadConfig', () => {
     expect((config as any).fileFiltering.customIgnoreFilePaths).toEqual([]);
   });
 
-  it('should initialize FileDiscoveryService with correct options', async () => {
-    const testPath = '/tmp/ignore';
-    vi.stubEnv('CUSTOM_IGNORE_FILE_PATHS', testPath);
-    const settings: Settings = {
-      fileFiltering: {
-        respectGitIgnore: false,
-      },
-    };
+  describe('policy engine configuration', () => {
+    it('should map tool settings into policySettings', async () => {
+      const settings: Settings = {
+        tools: {
+          allowed: ['v2-allowed'],
+          exclude: ['v2-exclude'],
+          core: ['v2-core'],
+        },
+        mcpServers: {
+          test: { command: 'test', args: [] },
+        },
+        policyPaths: ['/path/to/policy'],
+        adminPolicyPaths: ['/path/to/admin/policy'],
+      };
 
-    await loadConfig(settings, mockExtensionLoader, taskId);
+      await loadConfig(settings, mockExtensionLoader, taskId, true);
 
-    expect(FileDiscoveryService).toHaveBeenCalledWith(expect.any(String), {
-      respectGitIgnore: false,
-      respectGeminiIgnore: undefined,
-      customIgnoreFilePaths: [testPath],
+      expect(createPolicyEngineConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tools: {
+            core: ['v2-core'],
+            exclude: ['v2-exclude'],
+            allowed: ['v2-allowed'],
+          },
+          mcpServers: settings.mcpServers,
+          policyPaths: settings.policyPaths,
+          adminPolicyPaths: settings.adminPolicyPaths,
+        }),
+        ApprovalMode.DEFAULT,
+        undefined,
+        true,
+      );
     });
   });
 
   describe('tool configuration', () => {
-    it('should pass V1 allowedTools to Config properly', async () => {
-      const settings: Settings = {
-        allowedTools: ['shell', 'edit'],
-      };
-      await loadConfig(settings, mockExtensionLoader, taskId);
-      expect(Config).toHaveBeenCalledWith(
-        expect.objectContaining({
-          allowedTools: ['shell', 'edit'],
-        }),
-      );
-    });
-
     it('should pass V2 tools.allowed to Config properly', async () => {
       const settings: Settings = {
         tools: {
           allowed: ['shell', 'fetch'],
         },
       };
-      await loadConfig(settings, mockExtensionLoader, taskId);
+      await loadConfig(settings, mockExtensionLoader, taskId, true);
       expect(Config).toHaveBeenCalledWith(
         expect.objectContaining({
           allowedTools: ['shell', 'fetch'],
-        }),
-      );
-    });
-
-    it('should prefer V1 allowedTools over V2 tools.allowed if both present', async () => {
-      const settings: Settings = {
-        allowedTools: ['v1-tool'],
-        tools: {
-          allowed: ['v2-tool'],
-        },
-      };
-      await loadConfig(settings, mockExtensionLoader, taskId);
-      expect(Config).toHaveBeenCalledWith(
-        expect.objectContaining({
-          allowedTools: ['v1-tool'],
         }),
       );
     });
@@ -410,14 +427,19 @@ describe('loadConfig', () => {
         );
       });
 
-      it('should use default approval mode and empty rules when GEMINI_YOLO_MODE is not true', async () => {
+      it('should use default approval mode and load default rules when GEMINI_YOLO_MODE is not true', async () => {
         vi.stubEnv('GEMINI_YOLO_MODE', 'false');
         await loadConfig(mockSettings, mockExtensionLoader, taskId);
         expect(Config).toHaveBeenCalledWith(
           expect.objectContaining({
             approvalMode: 'default',
             policyEngineConfig: expect.objectContaining({
-              rules: [],
+              rules: expect.arrayContaining([
+                expect.objectContaining({
+                  toolName: 'read_file',
+                  decision: PolicyDecision.ALLOW,
+                }),
+              ]),
             }),
           }),
         );
@@ -523,5 +545,206 @@ describe('loadConfig', () => {
         );
       });
     });
+  });
+});
+
+describe('setIsTrusted', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    // Ensure GEMINI_CLI_TRUST_WORKSPACE is not set by default in tests to prevent leakage
+    vi.stubEnv('GEMINI_CLI_TRUST_WORKSPACE', '');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('should return agentSettings.isTrusted if defined, ignoring env vars', async () => {
+    vi.stubEnv('GEMINI_CLI_TRUST_WORKSPACE', 'false');
+    const { setIsTrusted } = await import('./config.js');
+    expect(setIsTrusted({ isTrusted: true } as AgentSettings)).toBe(true);
+
+    vi.stubEnv('GEMINI_CLI_TRUST_WORKSPACE', 'true');
+    expect(setIsTrusted({ isTrusted: false } as AgentSettings)).toBe(false);
+  });
+
+  it('should return true when GEMINI_CLI_TRUST_WORKSPACE env var is true and agentSettings.isTrusted is undefined', async () => {
+    vi.stubEnv('GEMINI_CLI_TRUST_WORKSPACE', 'true');
+    const { setIsTrusted } = await import('./config.js');
+    expect(setIsTrusted(undefined)).toBe(true);
+    expect(setIsTrusted({} as AgentSettings)).toBe(true);
+  });
+
+  it('should return false when GEMINI_CLI_TRUST_WORKSPACE env var is false and agentSettings.isTrusted is undefined', async () => {
+    vi.stubEnv('GEMINI_CLI_TRUST_WORKSPACE', 'false');
+    const { setIsTrusted } = await import('./config.js');
+    expect(setIsTrusted(undefined)).toBe(false);
+    expect(setIsTrusted({} as AgentSettings)).toBe(false);
+  });
+
+  it('should fallback to false if agentSettings.isTrusted and env var are undefined and no workspaceRoot is provided', async () => {
+    const { setIsTrusted } = await import('./config.js');
+    expect(setIsTrusted(undefined)).toBe(false);
+    expect(setIsTrusted({} as AgentSettings)).toBe(false);
+  });
+
+  it('should respect V2 security.folderTrust.enabled when checking workspace trust', async () => {
+    const settingsModule = await import('./settings.js');
+    const coreModule = await import('@google/gemini-cli-core');
+    vi.spyOn(settingsModule, 'loadSettings').mockReturnValue({
+      security: { folderTrust: { enabled: false } },
+    });
+    vi.mocked(coreModule.checkPathTrust).mockReturnValueOnce({
+      isTrusted: true,
+      source: 'file',
+    });
+
+    const { setIsTrusted } = await import('./config.js');
+    expect(setIsTrusted(undefined, '/tmp/workspace')).toBe(true);
+    expect(coreModule.checkPathTrust).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/tmp/workspace',
+        isFolderTrustEnabled: false,
+      }),
+    );
+  });
+});
+
+describe('loadConfig V1 and V2 settings compatibility', () => {
+  const mockExtensionLoader = {} as ExtensionLoader;
+  const taskId = 'test-task-v2';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv('GEMINI_API_KEY', 'test-key');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('should read V2 nested settings (security.folderTrust.enabled, general.checkpointing.enabled, ui.showMemoryUsage, context.fileFiltering, logging.level)', async () => {
+    const { logger } = await import('../utils/logger.js');
+    const v2Settings: Settings = {
+      security: { folderTrust: { enabled: true } },
+      general: { checkpointing: { enabled: false } },
+      ui: { showMemoryUsage: true },
+      context: {
+        fileFiltering: {
+          respectGitIgnore: false,
+          respectGeminiIgnore: true,
+          enableRecursiveFileSearch: true,
+          customIgnoreFilePaths: ['/v2/ignore'],
+        },
+      },
+      logging: { level: 'debug' },
+      telemetry: { enabled: false },
+    };
+
+    await loadConfig(v2Settings, mockExtensionLoader, taskId, true);
+
+    expect(logger.level).toBe('debug');
+    expect(Config).toHaveBeenCalledWith(
+      expect.objectContaining({
+        folderTrust: true,
+        checkpointing: false,
+        showMemoryUsage: true,
+        telemetry: expect.objectContaining({ enabled: false }),
+        fileFiltering: expect.objectContaining({
+          respectGitIgnore: false,
+          respectGeminiIgnore: true,
+          enableRecursiveFileSearch: true,
+          customIgnoreFilePaths: ['/v2/ignore'],
+        }),
+      }),
+    );
+  });
+
+  it('should not support unmigrated V1 flat settings directly in loadConfig', async () => {
+    const { validateSettings } = await import('./settings.js');
+    const rawV1Settings = {
+      folderTrust: true,
+      checkpointing: { enabled: false },
+      showMemoryUsage: true,
+      fileFiltering: {
+        respectGitIgnore: true,
+        customIgnoreFilePaths: ['/v1/ignore'],
+      },
+      logLevel: 'warn',
+      telemetryDisabled: true,
+      coreTools: ['read_file'],
+      excludeTools: ['shell'],
+      allowedTools: ['fetch'],
+    };
+
+    // V1 settings fail V2 schema validation when not migrated
+    expect(validateSettings(rawV1Settings).success).toBe(false);
+
+    await loadConfig(
+      rawV1Settings as unknown as Settings,
+      mockExtensionLoader,
+      taskId,
+      true,
+    );
+
+    // Unmigrated V1 flat properties are ignored by loadConfig
+    expect(Config).toHaveBeenCalledWith(
+      expect.objectContaining({
+        folderTrust: false,
+        checkpointing: undefined,
+        showMemoryUsage: false,
+        coreTools: undefined,
+        excludeTools: undefined,
+        allowedTools: undefined,
+        telemetry: expect.objectContaining({ enabled: undefined }),
+        fileFiltering: expect.objectContaining({
+          respectGitIgnore: undefined,
+          customIgnoreFilePaths: [],
+        }),
+      }),
+    );
+  });
+
+  it('should succeed when V1 flat settings are migrated via migrateDeprecatedSettings and passed to loadConfig', async () => {
+    const { logger } = await import('../utils/logger.js');
+    const { migrateDeprecatedSettings, validateSettings } = await import(
+      './settings.js'
+    );
+    const rawV1Settings = {
+      folderTrust: true,
+      checkpointing: { enabled: false },
+      showMemoryUsage: true,
+      fileFiltering: {
+        respectGitIgnore: true,
+        customIgnoreFilePaths: ['/v1/ignore'],
+      },
+      logLevel: 'warn',
+      telemetryDisabled: true,
+      coreTools: ['read_file'],
+      excludeTools: ['shell'],
+      allowedTools: ['fetch'],
+    };
+
+    const migratedSettings = migrateDeprecatedSettings(rawV1Settings);
+    expect(validateSettings(migratedSettings).success).toBe(true);
+
+    await loadConfig(migratedSettings, mockExtensionLoader, taskId, true);
+
+    expect(logger.level).toBe('warn');
+    expect(Config).toHaveBeenCalledWith(
+      expect.objectContaining({
+        folderTrust: true,
+        checkpointing: false,
+        showMemoryUsage: true,
+        coreTools: ['read_file'],
+        excludeTools: ['shell'],
+        allowedTools: ['fetch'],
+        telemetry: expect.objectContaining({ enabled: false }),
+        fileFiltering: expect.objectContaining({
+          respectGitIgnore: true,
+          customIgnoreFilePaths: ['/v1/ignore'],
+        }),
+      }),
+    );
   });
 });
